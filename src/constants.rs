@@ -138,7 +138,7 @@ pub enum SamplesPerSecond {
 }
 
 #[derive(PartialEq)]
-pub enum AfeCalibrationStatus {
+pub enum CalibrationStatus {
     InProgress,
     Failure,
     Success,

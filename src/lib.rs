@@ -1,229 +1,260 @@
 #![no_std]
 
 use byteorder::ByteOrder as _;
-use core::{iter, slice};
-use embedded_hal::{delay::DelayNs, i2c};
+use core::slice;
+use embedded_hal_async::delay;
+use embedded_hal_async::i2c;
 
 mod constants;
 pub use constants::*;
 
-pub type Result<T> = core::result::Result<T, Error>;
-
 #[derive(Debug)]
-pub enum Error {
-    I2cError,
+pub enum Error<E> {
+    GettingRegister(E),
+    RequestingRegister(E),
+    SettingRegister(E),
     PowerupFailed,
+    ReadingData(E),
+    ReadTimeout,
 }
 
-pub struct Nau7802<D: i2c::I2c> {
-    i2c_dev: D,
+pub struct Nau7802<I2C: i2c::I2c, DELAY: delay::DelayNs> {
+    i2c_dev: I2C,
+    delay: DELAY,
 }
 
-impl<D: i2c::I2c> Nau7802<D> {
+impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
     const DEVICE_ADDRESS: u8 = 0x2A;
 
     #[inline]
-    pub fn new<W: DelayNs>(i2c_dev: D, wait: &mut W) -> Result<Self> {
+    pub async fn new(i2c_dev: I2C, delay: DELAY) -> Result<Self, Error<I2C::Error>> {
         Self::new_with_settings(
             i2c_dev,
             Ldo::L3v3,
             Gain::G128,
             SamplesPerSecond::SPS10,
-            wait,
+            delay,
         )
+        .await
     }
 
-    pub fn new_with_settings<W: DelayNs>(
-        i2c_dev: D,
+    pub async fn new_with_settings(
+        i2c_dev: I2C,
         ldo: Ldo,
         gain: Gain,
         sps: SamplesPerSecond,
-        wait: &mut W,
-    ) -> Result<Self> {
-        let mut adc = Self { i2c_dev };
+        delay: DELAY,
+    ) -> Result<Self, Error<I2C::Error>> {
+        let mut adc = Self { i2c_dev, delay };
 
-        adc.start_reset()?;
-        // need 1 ms delay here maybe?
-        wait.delay_ms(1);
-        adc.finish_reset()?;
-        adc.power_up()?;
-        adc.set_ldo(ldo)?;
-        adc.set_gain(gain)?;
-        adc.set_sample_rate(sps)?;
-        adc.misc_init()?;
-        adc.begin_afe_calibration()?;
+        adc.reset().await?;
+        adc.power_up().await?;
+        adc.set_ldo(ldo).await?;
+        adc.set_gain(gain).await?;
+        adc.set_sample_rate(sps).await?;
+        adc.misc_init().await?;
+        adc.begin_calibration().await?;
 
-        while adc.poll_afe_calibration_status()? != AfeCalibrationStatus::Success {}
+        while adc.calibration_status().await? == CalibrationStatus::InProgress {
+            adc.delay.delay_ms(1).await;
+        }
 
         Ok(adc)
     }
 
-    pub fn destroy(self) -> D {
-        let Self { i2c_dev } = self;
-        i2c_dev
+    pub async fn data_available(&mut self) -> Result<bool, Error<I2C::Error>> {
+        self.get_bit(Register::PuCtrl, PuCtrlBits::CR).await
     }
 
-    pub fn data_available(&mut self) -> Result<bool> {
-        self.get_bit(Register::PuCtrl, PuCtrlBits::CR)
-    }
+    /// Checks for new data, will return after 110 milliseconds with an error if
+    /// no data could be read. (100 milliseconds is the longest the chip will
+    /// take for a reading.
+    pub async fn read(&mut self) -> Result<i32, Error<I2C::Error>> {
+        let mut attempt = 0;
+        while !self.data_available().await? {
+            if attempt >= 10 {
+                return Err(Error::ReadTimeout);
+            }
 
-    /// Checks for new data, returns nb::Error::WouldBlock if unavailable
-    pub fn read(&mut self) -> nb::Result<i32, Error> {
-        let data_available = self.data_available().map_err(nb::Error::Other)?;
-
-        if !data_available {
-            return Err(nb::Error::WouldBlock);
+            self.delay.delay_ms(10).await;
+            attempt += 1;
         }
 
-        self.read_unchecked().map_err(nb::Error::Other)
+        self.read_unchecked().await
     }
 
-    /// assumes that data_avaiable has been called and returned true
-    pub fn read_unchecked(&mut self) -> Result<i32> {
-        self.request_register(Register::AdcoB2)?;
+    /// assumes that data_available has been called and returned true
+    pub async fn read_unchecked(&mut self) -> Result<i32, Error<I2C::Error>> {
+        self.request_register(Register::AdcoB2).await?;
 
         let mut buf = [0u8; 3]; // will hold an i24
         self.i2c_dev
             .read(Self::DEVICE_ADDRESS, &mut buf)
-            .map_err(|_| Error::I2cError)?;
+            .await
+            .map_err(Error::ReadingData)?;
 
         let adc_result = byteorder::BigEndian::read_i24(&buf);
         Ok(adc_result)
     }
 
-    pub fn begin_afe_calibration(&mut self) -> Result<()> {
-        self.set_bit(Register::Ctrl2, Ctrl2RegisterBits::Cals)
+    pub async fn begin_calibration(&mut self) -> Result<(), Error<I2C::Error>> {
+        self.set_bit(Register::Ctrl2, Ctrl2RegisterBits::Cals).await
     }
 
-    pub fn poll_afe_calibration_status(&mut self) -> Result<AfeCalibrationStatus> {
-        if self.get_bit(Register::Ctrl2, Ctrl2RegisterBits::Cals)? {
-            return Ok(AfeCalibrationStatus::InProgress);
+    pub async fn calibration_status(
+        &mut self,
+    ) -> Result<CalibrationStatus, Error<I2C::Error>> {
+        if self
+            .get_bit(Register::Ctrl2, Ctrl2RegisterBits::Cals)
+            .await?
+        {
+            return Ok(CalibrationStatus::InProgress);
         }
 
-        if self.get_bit(Register::Ctrl2, Ctrl2RegisterBits::CalError)? {
-            return Ok(AfeCalibrationStatus::Failure);
+        if self
+            .get_bit(Register::Ctrl2, Ctrl2RegisterBits::CalError)
+            .await?
+        {
+            return Ok(CalibrationStatus::Failure);
         }
 
-        Ok(AfeCalibrationStatus::Success)
+        Ok(CalibrationStatus::Success)
     }
 
-    pub fn set_sample_rate(&mut self, sps: SamplesPerSecond) -> Result<()> {
-        const SPS_MASK: u8 = 0b10001111;
+    pub async fn set_sample_rate(
+        &mut self,
+        sps: SamplesPerSecond,
+    ) -> Result<(), Error<I2C::Error>> {
+        const SPS_MASK: u8 = 0b1000_1111;
         const SPS_START_BIT_IDX: u8 = 4;
 
-        self.set_function_helper(Register::Ctrl2, SPS_MASK, SPS_START_BIT_IDX, sps as _)
+        self.set_function_helper(Register::Ctrl2, SPS_MASK, SPS_START_BIT_IDX, sps as u8)
+            .await
     }
 
-    pub fn set_gain(&mut self, gain: Gain) -> Result<()> {
-        const GAIN_MASK: u8 = 0b11111000;
+    pub async fn set_gain(&mut self, gain: Gain) -> Result<(), Error<I2C::Error>> {
+        const GAIN_MASK: u8 = 0b1111_1000;
         const GAIN_START_BIT: u8 = 0;
 
-        self.set_function_helper(Register::Ctrl1, GAIN_MASK, GAIN_START_BIT, gain as _)
+        self.set_function_helper(Register::Ctrl1, GAIN_MASK, GAIN_START_BIT, gain as u8)
+            .await
     }
 
-    pub fn set_ldo(&mut self, ldo: Ldo) -> Result<()> {
-        const LDO_MASK: u8 = 0b11000111;
+    pub async fn set_ldo(&mut self, ldo: Ldo) -> Result<(), Error<I2C::Error>> {
+        const LDO_MASK: u8 = 0b1100_0111;
         const LDO_START_BIT: u8 = 3;
 
-        self.set_function_helper(Register::Ctrl1, LDO_MASK, LDO_START_BIT, ldo as _)?;
+        self.set_function_helper(Register::Ctrl1, LDO_MASK, LDO_START_BIT, ldo as u8)
+            .await?;
 
-        self.set_bit(Register::PuCtrl, PuCtrlBits::AVDDS)
+        self.set_bit(Register::PuCtrl, PuCtrlBits::AVDDS).await
     }
 
-    pub fn power_up(&mut self) -> Result<()> {
-        const NUM_ATTEMPTS: usize = 100;
+    pub async fn power_up(&mut self) -> Result<(), Error<I2C::Error>> {
+        self.set_bit(Register::PuCtrl, PuCtrlBits::PUD).await?;
+        self.set_bit(Register::PuCtrl, PuCtrlBits::PUA).await?;
 
-        self.set_bit(Register::PuCtrl, PuCtrlBits::PUD)?;
-        self.set_bit(Register::PuCtrl, PuCtrlBits::PUA)?;
-
-        let check_powered_up = || self.get_bit(Register::PuCtrl, PuCtrlBits::PUR);
-
-        let powered_up = iter::repeat_with(check_powered_up)
-            .take(NUM_ATTEMPTS)
-            .filter_map(Result::ok)
-            .any(|rdy| rdy == true);
-
-        if powered_up {
-            Ok(())
-        } else {
-            Err(Error::PowerupFailed)
+        for _attempt in 0..100 {
+            if self.is_powered_up().await? {
+                return Ok(());
+            } 
+            self.delay.delay_us(100).await;
         }
+
+        Err(Error::PowerupFailed)
     }
 
-    pub fn start_reset(&mut self) -> Result<()> {
-        self.set_bit(Register::PuCtrl, PuCtrlBits::RR)
+    async fn is_powered_up(&mut self) -> Result<bool, Error<I2C::Error>> {
+        self.get_bit(Register::PuCtrl, PuCtrlBits::PUR).await
     }
 
-    pub fn finish_reset(&mut self) -> Result<()> {
-        self.clear_bit(Register::PuCtrl, PuCtrlBits::RR)
+    pub async fn reset(&mut self) -> Result<(), Error<I2C::Error>> {
+        self.set_bit(Register::PuCtrl, PuCtrlBits::RR).await?;
+        self.delay.delay_ms(1).await;
+        self.clear_bit(Register::PuCtrl, PuCtrlBits::RR).await
     }
 
-    pub fn misc_init(&mut self) -> Result<()> {
+    pub async fn misc_init(&mut self) -> Result<(), Error<I2C::Error>> {
         const TURN_OFF_CLK_CHPL: u8 = 0x30;
 
         // Turn off CLK_CHP. From 9.1 power on sequencing
-        self.set_register(Register::Adc, TURN_OFF_CLK_CHPL)?;
+        self.set_register(Register::Adc, TURN_OFF_CLK_CHPL).await?;
 
         // Enable 330pF decoupling cap on chan 2. From 9.14 application circuit note
         self.set_bit(Register::PgaPwr, PgaPwrRegisterBits::CapEn)
+            .await
     }
 
-    fn set_function_helper(
+    async fn set_function_helper(
         &mut self,
         reg: Register,
         mask: u8,
         start_idx: u8,
         new_val: u8,
-    ) -> Result<()> {
-        let mut val = self.get_register(reg)?;
+    ) -> Result<(), Error<I2C::Error>> {
+        let mut val = self.get_register(reg).await?;
         val &= mask;
         val |= new_val << start_idx;
 
-        self.set_register(reg, val)
+        self.set_register(reg, val).await
     }
 
-    fn set_bit<B: RegisterBits>(&mut self, addr: Register, bit_idx: B) -> Result<()> {
-        let mut val = self.get_register(addr)?;
+    async fn set_bit<B: RegisterBits>(
+        &mut self,
+        addr: Register,
+        bit_idx: B,
+    ) -> Result<(), Error<I2C::Error>> {
+        let mut val = self.get_register(addr).await?;
         val |= 1 << bit_idx.get();
-        self.set_register(addr, val)
+        self.set_register(addr, val).await
     }
 
-    fn clear_bit<B: RegisterBits>(&mut self, addr: Register, bit_idx: B) -> Result<()> {
-        let mut val = self.get_register(addr)?;
+    async fn clear_bit<B: RegisterBits>(
+        &mut self,
+        addr: Register,
+        bit_idx: B,
+    ) -> Result<(), Error<I2C::Error>> {
+        let mut val = self.get_register(addr).await?;
         val &= !(1 << bit_idx.get());
-        self.set_register(addr, val)
+        self.set_register(addr, val).await
     }
 
-    fn get_bit<B: RegisterBits>(&mut self, addr: Register, bit_idx: B) -> Result<bool> {
-        let mut val = self.get_register(addr)?;
+    async fn get_bit<B: RegisterBits>(
+        &mut self,
+        addr: Register,
+        bit_idx: B,
+    ) -> Result<bool, Error<I2C::Error>> {
+        let mut val = self.get_register(addr).await?;
         val &= 1 << bit_idx.get();
         Ok(val != 0)
     }
 
-    fn set_register(&mut self, reg: Register, val: u8) -> Result<()> {
+    async fn set_register(&mut self, reg: Register, val: u8) -> Result<(), Error<I2C::Error>> {
         let transaction = [reg as _, val];
 
         self.i2c_dev
             .write(Self::DEVICE_ADDRESS, &transaction)
-            .map_err(|_| Error::I2cError)
+            .await
+            .map_err(Error::SettingRegister)
     }
 
-    fn get_register(&mut self, reg: Register) -> Result<u8> {
-        self.request_register(reg)?;
+    async fn get_register(&mut self, reg: Register) -> Result<u8, Error<I2C::Error>> {
+        self.request_register(reg).await?;
 
         let mut val = 0;
         self.i2c_dev
             .read(Self::DEVICE_ADDRESS, slice::from_mut(&mut val))
-            .map_err(|_| Error::I2cError)?;
-
+            .await
+            .map_err(Error::GettingRegister)?;
         Ok(val)
     }
 
-    fn request_register(&mut self, reg: Register) -> Result<()> {
+    async fn request_register(&mut self, reg: Register) -> Result<(), Error<I2C::Error>> {
         let reg = reg as u8;
 
         self.i2c_dev
             .write(Self::DEVICE_ADDRESS, slice::from_ref(&reg))
-            .map_err(|_| Error::I2cError)
+            .await
+            .map_err(Error::RequestingRegister)
     }
 }
