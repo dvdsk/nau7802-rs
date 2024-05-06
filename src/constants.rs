@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u8)]
-pub enum Register {
+pub(crate) enum Register {
     PuCtrl = 0x00,
     Ctrl1,
     Ctrl2,
@@ -34,7 +34,7 @@ pub enum Register {
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u8)]
-pub enum PuCtrlBits {
+pub(crate) enum PuCtrlBits {
     RR = 0,
     PUD,
     PUA,
@@ -48,7 +48,7 @@ pub enum PuCtrlBits {
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u8)]
-pub enum PgaRegisterBits {
+pub(crate) enum PgaRegisterBits {
     ChpDis = 0,
     Inv = 3,
     BypassEn,
@@ -60,7 +60,7 @@ pub enum PgaRegisterBits {
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u8)]
-pub enum PgaPwrRegisterBits {
+pub(crate) enum PgaPwrRegisterBits {
     Curr = 0,
     AdcCurr = 2,
     MstrBiasCurr = 4,
@@ -70,7 +70,7 @@ pub enum PgaPwrRegisterBits {
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(u8)]
-pub enum Ctrl2RegisterBits {
+pub(crate) enum Ctrl2RegisterBits {
     CalMod = 0,
     Cals = 2,
     CalError = 3,
@@ -101,6 +101,7 @@ impl_register_bits!(
     Ctrl2RegisterBits
 );
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum Ldo {
@@ -114,6 +115,7 @@ pub enum Ldo {
     L4v5 = 0b000,
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum Gain {
@@ -127,6 +129,7 @@ pub enum Gain {
     G1 = 0b000,
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum SamplesPerSecond {
@@ -140,6 +143,5 @@ pub enum SamplesPerSecond {
 #[derive(PartialEq)]
 pub enum CalibrationStatus {
     InProgress,
-    Failure,
     Success,
 }

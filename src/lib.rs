@@ -9,13 +9,75 @@ mod constants;
 pub use constants::*;
 
 #[derive(Debug)]
+#[cfg_attr(feature = "thiserror", derive(thiserror::Error))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error<E> {
+    #[cfg_attr(feature = "thiserror", error("I²C error getting registers: {0}"))]
     GettingRegister(E),
+    #[cfg_attr(
+        feature = "thiserror",
+        error("I²C error requesting to read register: {0}")
+    )]
     RequestingRegister(E),
+    #[cfg_attr(feature = "thiserror", error("I²C error setting register: {0}"))]
     SettingRegister(E),
+    #[cfg_attr(
+        feature = "thiserror",
+        error("Power up failed, device did not respond in time")
+    )]
     PowerupFailed,
+    #[cfg_attr(feature = "thiserror", error("I²C while reading measurement"))]
     ReadingData(E),
+    #[cfg_attr(feature = "thiserror", error("New data was not ready in time"))]
     ReadTimeout,
+    #[cfg_attr(feature = "thiserror", error("Device reported calibration failure"))]
+    CalibrationFailure,
+}
+
+impl<E> Clone for Error<E>
+where
+    E: Clone,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Error::GettingRegister(e) => Error::GettingRegister(e.clone()),
+            Error::RequestingRegister(e) => Error::RequestingRegister(e.clone()),
+            Error::SettingRegister(e) => Error::SettingRegister(e.clone()),
+            Error::PowerupFailed => Error::PowerupFailed,
+            Error::ReadingData(e) => Error::ReadingData(e.clone()),
+            Error::ReadTimeout => Error::ReadTimeout,
+            Error::CalibrationFailure => Error::CalibrationFailure,
+        }
+    }
+}
+
+#[cfg(feature = "postcard")]
+impl<E> postcard::experimental::max_size::MaxSize for Error<E>
+where
+    E: postcard::experimental::max_size::MaxSize,
+{
+    const POSTCARD_MAX_SIZE: usize = 1 + E::POSTCARD_MAX_SIZE;
+}
+
+impl<E> Eq for Error<E> where E: Eq {}
+
+impl<E> PartialEq for Error<E>
+where
+    E: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Error::GettingRegister(e1), Error::GettingRegister(e2)) => e1 == e2,
+            (Error::RequestingRegister(e1), Error::RequestingRegister(e2)) => e1 == e2,
+            (Error::SettingRegister(e1), Error::SettingRegister(e2)) => e1 == e2,
+            (Error::PowerupFailed, Error::PowerupFailed) => true,
+            (Error::ReadingData(e1), Error::ReadingData(e2)) => e1 == e2,
+            (Error::ReadTimeout, Error::ReadTimeout) => true,
+            (Error::CalibrationFailure, Error::CalibrationFailure) => true,
+            (_, _) => false,
+        }
+    }
 }
 
 pub struct Nau7802<I2C: i2c::I2c, DELAY: delay::DelayNs> {
@@ -53,16 +115,12 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
         adc.set_gain(gain).await?;
         adc.set_sample_rate(sps).await?;
         adc.misc_init().await?;
-        adc.begin_calibration().await?;
-
-        while adc.calibration_status().await? == CalibrationStatus::InProgress {
-            adc.delay.delay_ms(1).await;
-        }
+        adc.calibrate().await?;
 
         Ok(adc)
     }
 
-    pub async fn data_available(&mut self) -> Result<bool, Error<I2C::Error>> {
+    async fn data_available(&mut self) -> Result<bool, Error<I2C::Error>> {
         self.get_bit(Register::PuCtrl, PuCtrlBits::CR).await
     }
 
@@ -84,7 +142,7 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
     }
 
     /// assumes that data_available has been called and returned true
-    pub async fn read_unchecked(&mut self) -> Result<i32, Error<I2C::Error>> {
+    async fn read_unchecked(&mut self) -> Result<i32, Error<I2C::Error>> {
         self.request_register(Register::AdcoB2).await?;
 
         let mut buf = [0u8; 3]; // will hold an i24
@@ -97,13 +155,18 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
         Ok(adc_result)
     }
 
-    pub async fn begin_calibration(&mut self) -> Result<(), Error<I2C::Error>> {
-        self.set_bit(Register::Ctrl2, Ctrl2RegisterBits::Cals).await
+    pub async fn calibrate(&mut self) -> Result<(), Error<I2C::Error>> {
+        self.set_bit(Register::Ctrl2, Ctrl2RegisterBits::Cals)
+            .await?;
+
+        while self.calibration_status().await? == CalibrationStatus::InProgress {
+            self.delay.delay_ms(1).await;
+        }
+
+        Ok(())
     }
 
-    pub async fn calibration_status(
-        &mut self,
-    ) -> Result<CalibrationStatus, Error<I2C::Error>> {
+    async fn calibration_status(&mut self) -> Result<CalibrationStatus, Error<I2C::Error>> {
         if self
             .get_bit(Register::Ctrl2, Ctrl2RegisterBits::Cals)
             .await?
@@ -115,7 +178,7 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
             .get_bit(Register::Ctrl2, Ctrl2RegisterBits::CalError)
             .await?
         {
-            return Ok(CalibrationStatus::Failure);
+            return Err(Error::CalibrationFailure);
         }
 
         Ok(CalibrationStatus::Success)
@@ -150,15 +213,18 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
         self.set_bit(Register::PuCtrl, PuCtrlBits::AVDDS).await
     }
 
-    pub async fn power_up(&mut self) -> Result<(), Error<I2C::Error>> {
+    async fn power_up(&mut self) -> Result<(), Error<I2C::Error>> {
         self.set_bit(Register::PuCtrl, PuCtrlBits::PUD).await?;
         self.set_bit(Register::PuCtrl, PuCtrlBits::PUA).await?;
 
-        for _attempt in 0..100 {
+        // After about 200 microseconds, the PWRUP bit will be Logic=1 indicating the
+        // device is ready for the remaining programming setup.
+        self.delay.delay_us(200).await;
+        for attempt in 0..5 {
             if self.is_powered_up().await? {
                 return Ok(());
-            } 
-            self.delay.delay_us(100).await;
+            }
+            self.delay.delay_us(5 * attempt).await;
         }
 
         Err(Error::PowerupFailed)
@@ -168,13 +234,13 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
         self.get_bit(Register::PuCtrl, PuCtrlBits::PUR).await
     }
 
-    pub async fn reset(&mut self) -> Result<(), Error<I2C::Error>> {
+    async fn reset(&mut self) -> Result<(), Error<I2C::Error>> {
         self.set_bit(Register::PuCtrl, PuCtrlBits::RR).await?;
         self.delay.delay_ms(1).await;
         self.clear_bit(Register::PuCtrl, PuCtrlBits::RR).await
     }
 
-    pub async fn misc_init(&mut self) -> Result<(), Error<I2C::Error>> {
+    async fn misc_init(&mut self) -> Result<(), Error<I2C::Error>> {
         const TURN_OFF_CLK_CHPL: u8 = 0x30;
 
         // Turn off CLK_CHP. From 9.1 power on sequencing
@@ -239,6 +305,7 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
     }
 
     async fn get_register(&mut self, reg: Register) -> Result<u8, Error<I2C::Error>> {
+        todo!("write_read?");
         self.request_register(reg).await?;
 
         let mut val = 0;
