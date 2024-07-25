@@ -1,5 +1,5 @@
 [package]
-name = "async-nau7802"
+name = "nau7802-async"
 version = "0.2.0"
 authors = ["Amer Safdari <amersafdari@gmail.com>"]
 edition = "2021"
