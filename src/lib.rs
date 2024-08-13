@@ -124,17 +124,20 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
         self.get_bit(Register::PuCtrl, PuCtrlBits::CR).await
     }
 
-    /// Checks for new data, will return after 110 milliseconds with an error if
+    /// Checks for new data, will return after ~400 milliseconds with an error if
     /// no data could be read. (100 milliseconds is the longest the chip will
     /// take for a reading.
-    pub async fn read(&mut self) -> Result<i32, Error<I2C::Error>> {
+    ///
+    /// result is 24bit unsigned
+    pub async fn read(&mut self) -> Result<u32, Error<I2C::Error>> {
         let mut attempt = 0;
         while !self.data_available().await? {
-            if attempt >= 10 {
+            if attempt >= 4 {
+                // 10 (100ms) should work but it does not 
                 return Err(Error::ReadTimeout);
             }
 
-            self.delay.delay_ms(10).await;
+            self.delay.delay_ms(100).await;
             attempt += 1;
         }
 
@@ -142,7 +145,7 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
     }
 
     /// assumes that data_available has been called and returned true
-    async fn read_unchecked(&mut self) -> Result<i32, Error<I2C::Error>> {
+    async fn read_unchecked(&mut self) -> Result<u32, Error<I2C::Error>> {
         self.request_register(Register::AdcoB2).await?;
 
         let mut buf = [0u8; 3]; // will hold an i24
@@ -151,7 +154,7 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
             .await
             .map_err(Error::ReadingData)?;
 
-        let adc_result = byteorder::BigEndian::read_i24(&buf);
+        let adc_result = byteorder::BigEndian::read_u24(&buf);
         Ok(adc_result)
     }
 
@@ -305,12 +308,13 @@ impl<I2C: i2c::I2c, DELAY: delay::DelayNs> Nau7802<I2C, DELAY> {
     }
 
     async fn get_register(&mut self, reg: Register) -> Result<u8, Error<I2C::Error>> {
-        todo!("write_read?");
-        self.request_register(reg).await?;
-
         let mut val = 0;
         self.i2c_dev
-            .read(Self::DEVICE_ADDRESS, slice::from_mut(&mut val))
+            .write_read(
+                Self::DEVICE_ADDRESS,
+                slice::from_ref(&(reg as u8)),
+                slice::from_mut(&mut val),
+            )
             .await
             .map_err(Error::GettingRegister)?;
         Ok(val)
