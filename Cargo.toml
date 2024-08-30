@@ -1,17 +1,21 @@
 [package]
-name = "nau7802-async"
+name = "nau7802"
 version = "0.2.0"
-authors = ["Amer Safdari <amersafdari@gmail.com>"]
+authors = ["David Kleingeld <open-source@davidsk.dev>", "Amer Safdari <amersafdari@gmail.com>"]
 edition = "2021"
 readme = "README.md"
 license = "MIT"
-description = "Rust library for the NAU7802 I2C ADC using embedded-hal-async"
+description = "Rust library for the NAU7802 I2C ADC using embedded-hal(-async)"
 
 [lib]
 test = false
 bench = false
 
 [features]
+# useful on an async platform where you have no extra async i2c
+# for example because you ran out of DMA
+blocking_i2c = ["dep:embedded-hal"]
+
 thiserror = ["dep:thiserror"]
 serde = ["dep:serde"]
 # derive's MaxSize on Error enum
@@ -19,7 +23,9 @@ postcard = ["dep:postcard"]
 defmt = ["dep:defmt", "embedded-hal-async/defmt-03"]
 
 [dependencies]
-embedded-hal-async = "1.0.0"
+embedded-hal-async = { version = "1.0.0" }
+embedded-hal = { version = "1.0.0", optional = true }
+
 defmt = { version = "0.3", optional = true }
 thiserror = { version = "1.0.38", optional = true }
 serde = { version = "1.0", features = ["derive"], default-features = false, optional = true }
